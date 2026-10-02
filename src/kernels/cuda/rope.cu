@@ -32,6 +32,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <vector>
 #include <cstdlib>
 
 namespace strata::kernels {
@@ -47,11 +48,14 @@ const RopeScaling& rope_scaling() { return g_rope_scaling; }
 
 void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, float* sin_tab) {
     const int half = n_rot / 2;
+    std::vector<double> inv_((size_t) half);
+    // `inv` depends on the PAIR index alone, so it is computed once per pair rather than once per (position,
+    // pair).  At a million positions the old inner `pow` was 33.5 M calls on the startup thread for a value
+    // that repeats every position; hoisting it changes no bit (same double, same order of the rest).
+    for (int i = 0; i < half; ++i) inv_[i] = std::pow(theta, -2.0 * (double) i / (double) n_rot);
     for (int p = 0; p < max_pos; ++p) {
         for (int i = 0; i < half; ++i) {
-            // float64 throughout, in the reference's order: inv, then ang, then cos/sin
-            const double inv = std::pow(theta, -2.0 * (double) i / (double) n_rot);
-            const double ang = (double) p * inv;
+            const double ang = (double) p * inv_[i];
             cos_tab[(size_t) p * half + i] = (float) std::cos(ang);
             sin_tab[(size_t) p * half + i] = (float) std::sin(ang);
         }
@@ -69,16 +73,18 @@ void build_rope_table(int n_rot, const RopeScaling& sc, int max_pos, float* cos_
     double cd[2];
     sc.corr_dims(n_rot, cd);
     const bool correct = sc.ext_factor != 0;   // ggml: the correction rides on ext_factor, not the type
+    std::vector<double> inv_((size_t) half), ramp_((size_t) half);
+    // Both of these are functions of the pair index only (the same hoist as above, and the same guarantee).
+    for (int i = 0; i < half; ++i) {
+        inv_[i] = std::pow(sc.freq_base, -2.0 * (double) i / (double) n_rot);
+        ramp_[i] = correct ? (double) rope_yarn_ramp((float) cd[0], (float) cd[1], i) * sc.ext_factor : 0.0;
+    }
     for (int p = 0; p < max_pos; ++p) {
         for (int i = 0; i < half; ++i) {
-            const double inv = std::pow(sc.freq_base, -2.0 * (double) i / (double) n_rot);
-            const double extrap = (double) p * inv;    // the trained angle, ggml's theta_extrap
-            const double interp = fs * extrap;         // ggml's theta_interp
+            const double extrap = (double) p * inv_[i];    // the trained angle, ggml's theta_extrap
+            const double interp = fs * extrap;             // ggml's theta_interp
             double ang = interp;
-            if (correct) {
-                const double ramp = (double) rope_yarn_ramp((float) cd[0], (float) cd[1], i) * sc.ext_factor;
-                ang = interp * (1.0 - ramp) + extrap * ramp;
-            }
+            if (correct) ang = interp * (1.0 - ramp_[i]) + extrap * ramp_[i];
             cos_tab[(size_t) p * half + i] = (float) (std::cos(ang) * ms);
             sin_tab[(size_t) p * half + i] = (float) (std::sin(ang) * ms);
         }

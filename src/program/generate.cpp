@@ -264,6 +264,11 @@ struct Options {
     bool no_host_worker = false;
     bool coupled_draft = strata::core::coupled_draft_env(); ///< Coupled draft sampling for MTP drafter under sampling
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
+    /// `--all-experts-vram`: every routed expert lives on a GPU for the whole run.  The host arena is never
+    /// allocated (the experts are read from the model's own file straight into the cache slots and the pages are
+    /// dropped), the PCIe and CPU-miss paths are switched off, and the prompt path keeps its own buffers rather
+    /// than borrowing slots it would have to re-read.  Startup refuses when the cards cannot hold all of them.
+    bool all_experts_vram = false;
     std::string shared_expert_arena; ///< Linux: optional file backing for the resident arena shared by processes
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM PC's resident mode, chosen by setup): `--resident-cpu-experts` with the copy
@@ -432,7 +437,8 @@ void usage() {
                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
                  "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
                  "  --kv fp16|int8       KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
-                 "                       VRAM; default fp16 until gate G-C accepts int8\n"
+                 "                       VRAM; fp16 (the default) stores K and V as they are computed, 2,048 B per\n"
+                 "                       token per QSA layer against int8's 1,056\n"
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
@@ -467,6 +473,12 @@ void usage() {
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
                  "  --max-new N          tokens to generate (default 16)\n"
                  "  --max-context N      KV/state capacity (default 4096)\n"
+                 "  --all-experts-vram   keep every routed expert on the GPU(s): no host expert arena, no PCIe\n"
+                 "                       share, no adaptive swaps, and the prompt path keeps its own buffers.\n"
+                 "                       Needs --expert-profile with every pair and enough VRAM for all of them;\n"
+                 "                       it refuses at start, naming the GiB short, when they do not fit.\n"
+                 "                       The expert bytes are moved once, over the link: on a slow link the\n"
+                 "                       first start is long, and every later token never touches it.\n"
                  "  --rope-scaling T     extend the context past the trained one: none, linear\n"
                  "                       (position interpolation) or yarn - llama.cpp's types and names.\n"
                  "                       Default: the model file's rope keys, else none. Fixed at startup:\n"
@@ -659,6 +671,47 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
         }
     }
 }
+
+/// `--all-experts-vram` moves the whole expert set across the link once, at start: 119.5 GiB of Q8_0 experts, of
+/// which each of four cards takes its own 29.9 GiB.  On a Gen1 x4 link (a CMP 170HX: about 1 GB/s) that is about
+/// 30 s per card, and the cards run at the same time; on a x16 link it is a second.  The report exists because a
+/// start this size otherwise prints nothing for half a minute, and because the rate it prints is the number that
+/// says whether the link is the one you think it is.  Outside that mode it stays quiet: the usual profile fill is
+/// a few GiB and finishes before anyone wonders about it.
+struct FillReport {
+    bool on = false;
+    const char* tag = "";
+    int64_t pairs = 0, done_pairs = 0;
+    uint64_t bytes = 0, done_bytes = 0, next_mark = 0;
+    std::chrono::steady_clock::time_point t0{};
+    void start(int64_t n_pairs, uint64_t total) {
+        pairs = n_pairs;
+        bytes = total;
+        if (!on || bytes == 0) return;
+        t0 = std::chrono::steady_clock::now();
+        next_mark = 2ull << 30;
+        std::fprintf(stderr, "strata generate: %s: filling the expert cache, %.2f GiB over the link (%lld experts)\n",
+                     tag, (double) bytes / 1073741824.0, (long long) pairs);
+    }
+    void step(uint64_t b) {
+        if (!on || bytes == 0) return;
+        done_bytes += b;
+        ++done_pairs;
+        if (done_bytes < next_mark && done_pairs < pairs) return;
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const double rate = s > 0.0 ? (double) done_bytes / s : 0.0;
+        const double left = rate > 0.0 ? (double) (bytes - done_bytes) / rate : 0.0;
+        std::lock_guard<std::mutex> lk(mu_);
+        std::fprintf(stderr, "strata generate:   %s: %lld of %lld experts, %.2f of %.2f GiB, %.2f GiB/s, about "
+                             "%.0f min left\n", tag, (long long) done_pairs, (long long) pairs,
+                     (double) done_bytes / 1073741824.0, (double) bytes / 1073741824.0, rate / 1073741824.0,
+                     left / 60.0);
+        next_mark = done_bytes + (2ull << 30);
+    }
+    /// The lines are one fprintf each, but several cards fill at the same time in --all-experts-vram.
+    static std::mutex mu_;
+};
+std::mutex FillReport::mu_;
 
 /// Layer split: every verify stage shares one Drive (its counters, usage and failure flags); the GPU plan, the expert
 /// cache and the PCIe share the pool uses for a layer are those of the stage that runs it.
@@ -1212,6 +1265,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
+        else if (a == "--all-experts-vram") o.all_experts_vram = true;
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
         else if (a == "--resident-experts") {
@@ -1337,6 +1391,37 @@ int main(int argc, char** argv) {
     if (o.resident_cpu_experts && (!o.layer_split.empty() || remote_caches)) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
         return 2;
+    }
+    // ---- --all-experts-vram: the whole expert set on the GPU(s), no host copy at all.
+    //
+    // The mode exists for a card with a lot of VRAM and a thin link.  A Q8_0 expert is 5.22 MB, so at the ~1 GB/s
+    // of a Gen1 x4 link (a CMP 170HX) one crosses in 5.2 ms - several times what the CPU pool takes to compute the
+    // same expert, and 10 of them are routed per layer.  Streaming misses on such a card is the slow option, and
+    // the 128 GB host copy the arena implies is a second one.  So the arena is skipped, and every knob that
+    // assumes a miss can happen is switched off rather than tuned: a miss here is a startup error, not a slow token.
+    if (o.all_experts_vram) {
+        if (o.resident_cpu_experts || o.resident_budget > 0) {
+            std::fprintf(stderr, "strata generate: --all-experts-vram keeps no copy of the experts in RAM, so it "
+                                 "cannot be combined with --resident-experts or --resident-budget-gib\n");
+            return 2;
+        }
+        if (remote_caches) {
+            std::fprintf(stderr, "strata generate: --all-experts-vram leaves no expert for a helper cache "
+                                 "(--expert-cache-remote)\n");
+            return 2;
+        }
+        if (o.expert_profile.empty()) {
+            // without a profile the fill is whatever the run routes first, so nothing says "all of them"
+            std::fprintf(stderr, "strata generate: --all-experts-vram needs --expert-profile with every (layer, "
+                                 "expert) pair ranked (tools/make_profile.py writes one for the whole model)\n");
+            return 2;
+        }
+        o.mmap_experts = true;        // read from the model's own file; the arena is never allocated
+        o.no_prefill_borrow = true;   // a lent slot would have to come back from the file
+        o.pcie_frac = 0.0;            // nothing crosses the link mid-token
+        o.adapt_swaps = 0;            // nothing to swap in: the tier is already complete
+        std::fprintf(stderr, "strata generate: --all-experts-vram: no host expert arena, no PCIe share, no "
+                             "adaptive swaps; the prompt path keeps its own buffers\n");
     }
     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
@@ -2440,7 +2525,16 @@ int main(int argc, char** argv) {
     {
         const strata::core::OnDevice on0(0);
         const int64_t hi0 = multi_gpu ? split_at[0] : -1;
-        if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
+        const uint64_t sess0 = strata::core::session_bytes(g, o.max_context, K, 0, hi0);
+        // The number a long context is actually paid with, printed BEFORE the allocation: at 1M positions the
+        // difference between --kv fp16 and --kv int8 is 12 GiB per card, and finding that out from a failed
+        // cudaMalloc tells you nothing about which knob to turn.
+        if (o.max_context >= 65536)
+            std::fprintf(stderr, "strata generate: CUDA0's session (--kv %s, %lld positions, layers 0-%lld) needs "
+                                 "%.2f GiB of VRAM%s\n", o.kv.c_str(), (long long) o.max_context,
+                         (long long) (hi0 < 0 ? g.n_layers - 1 : hi0 - 1), (double) sess0 / 1073741824.0,
+                         o.kv_resident > 0 ? " - the K/V beyond the resident window streams from pinned RAM" : "");
+        if (cudaMalloc(&sbuf, sess0) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
         }
@@ -2840,51 +2934,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "                 PROFILE, ranked by routing frequency, no eviction.\n");
         }
     }
-    // ---- R4.2e: fill the tier from the profile.  This is the only place the plan is applied, and it runs
-    // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
-    // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
-    // the policy rather than a hint.
-    int64_t prefilled = 0;
-    if (!profile.empty() && srcp != nullptr) {
-        // #369 (dag08): per layer, a full layer skips only its own pairs - each layer takes its hottest experts until
-        // its range is full (one full layer used to end the whole fill, leaving most layers empty)
-        const bool per_layer = xcache.per_layer_admission();
-        const int64_t want = per_layer ? (int64_t) profile.size()
-                                       : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
-        for (int64_t i = 0; i < want; ++i) {
-            const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (slot == strata::core::kNotResident) {
-                if (per_layer) continue;
-                break;
-            }
-            const uint8_t* b = srcp->blob(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
-                std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
-                             (long long) i, err.c_str());
-                return 1;
-            }
-            ++prefilled;
-        }
-        // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
-        // about bytes produces a plausible token, which is this project's most expensive failure mode; the
-        // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
-        if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
-                                srcp->blob(profile[0].first, profile[0].second), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
-        }
-        mem_mark("the profile fill");
-        std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
-                     (long long) prefilled, (long long) (per_layer ? xcache.slots() : want));
-    }
-
+    // ---- The later stages' caches are OPENED here, before anything is copied: each is sized from what its own
+    // card has left once its own session, dense weights, head and drafter are up (the drafter and the head are
+    // loaded above, so `free_b` has already lost them), and what is held back here is the verify windows.
     for (auto& stp : stages) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
-        // the drafter and the head are already allocated by now (they load above, before this), so what is left
-        // to hold back is the windows - and `free_b` has already lost the drafter.
         const int64_t room = stage_room(st.dev, true, false);
         const strata::core::OnDevice on(st.dev);
         std::vector<int64_t> sized;
@@ -2902,33 +2957,168 @@ int main(int argc, char** argv) {
                          sized.empty() ? "no room" : err.c_str());
             return 1;
         }
+    }
+    // ---- R4.2e: fill the tier from the profile.  This is the only place the plan is applied, and it runs
+    // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
+    // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
+    // the policy rather than a hint.
+    //
+    // ---- THE FILL OF ONE TIER, AS A FUNCTION, BECAUSE --ALL-EXPERTS-VRAM RUNS IT ON EVERY CARD AT ONCE.
+    // Each card has its own context, its own link and its own slice of the model's file, so the wait is the
+    // slowest card's share rather than the sum of all of them: on four cards that is a quarter of the time, which
+    // at the ~1 GB/s of a Gen1 x4 link (a CMP 170HX) is the difference between about 2 minutes and about 30
+    // seconds.  Everywhere else the order is what it always was - CUDA0's cache, then each later stage.
+    // `fill_tier` claims and copies the pairs `pairs` names into `cache`, then reads one slot back.  False with
+    // `why` set: the caller stops the run (a half-filled tier is a tier with wrong experts in it).
+    auto fill_tier = [&](strata::core::ExpertCache& cache, int dev,
+                         const std::vector<std::pair<int32_t, int32_t>>& pairs,
+                         const char* who, std::string& why, bool require_any = false) -> bool {
+        if (pairs.empty()) return true;
+        const strata::core::OnDevice on(dev);   // the copies below are on this card's context
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        FillReport rep;
+        rep.on = o.all_experts_vram;
+        rep.tag = who;
+        if (rep.on) {
+            uint64_t total = 0;
+            for (const auto& pr : pairs) total += (uint64_t) ((lay.blob_bytes(pr.first) + 255) / 256 * 256);
+            rep.start((int64_t) pairs.size(), total);
+        }
+        // #369 (dag08): per layer, a full layer skips only its own pairs - each layer takes its hottest experts until
+        // its range is full (one full layer used to end the whole fill, leaving most layers empty)
+        const bool per_layer = cache.per_layer_admission();
+        const int64_t want = per_layer ? (int64_t) pairs.size()
+                                       : std::min<int64_t>((int64_t) pairs.size(), cache.slots());
+        // In --all-experts-vram each tier copies through ONE buffer of its own instead of the source's staging
+        // pool: the pool keeps every blob it has ever assembled until it ages out, and a fill that touches all
+        // 24,576 of them holds gigabytes of host RAM for bytes no token will ever ask for again.
+        std::vector<uint8_t> staging;
+        const auto blob_at = [&](int64_t layer, int64_t expert, int64_t bytes) -> const uint8_t* {
+            if (!o.all_experts_vram) return srcp->blob(layer, expert);
+            if (staging.size() < (size_t) bytes) staging.resize((size_t) bytes);
+            return srcp->copy_blob(layer, expert, staging.data()) ? staging.data() : nullptr;
+        };
         int64_t filled = 0;
-        for (const auto& pr : st.profile) {
-            if (filled >= st.cache.slots()) break;
-            const int32_t slot = st.cache.admit(pr.first, pr.second);
-            if (slot == strata::core::kNotResident) break;
-            const uint8_t* b = srcp->blob(pr.first, pr.second);
-            if (b == nullptr || !st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first))) {
-                std::fprintf(stderr, "strata generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
-                             st.dev, (long long) filled, err.c_str());
-                return 1;
+        for (int64_t i = 0; i < want; ++i) {
+            const int32_t slot = cache.admit(pairs[(size_t) i].first, pairs[(size_t) i].second);
+            if (slot == strata::core::kNotResident) {
+                if (per_layer) continue;
+                break;
             }
+            const int64_t nb = (int64_t) lay.blob_bytes(pairs[(size_t) i].first);
+            const uint8_t* b = blob_at(pairs[(size_t) i].first, pairs[(size_t) i].second, nb);
+            if (b == nullptr || !cache.fill_slot_blocking(slot, b, why, nb)) {
+                why = std::string(who) + ": the profile fill failed at pair " + std::to_string((long long) i) +
+                      ": " + why;
+                return false;
+            }
+            rep.step((uint64_t) nb);
             ++filled;
         }
-        if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
-                                                 srcp->blob(st.profile[0].first, st.profile[0].second), err,
-                                                 (int64_t) lay.blob_bytes(st.profile[0].first))) {
-            std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s\n", st.dev,
-                         filled == 0 ? "nothing filled" : err.c_str());
-            return 1;
+        // A later stage with an empty cache has no layers to run, whatever it was sized to: the split check that
+        // ran before this refactor caught that with "nothing filled", and the check is kept.
+        if (require_any && filled == 0) {
+            why = std::string(who) + ": expert cache: nothing filled";
+            return false;
         }
+        // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
+        // about bytes produces a plausible token, which is this project's most expensive failure mode; the
+        // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
+        {
+            const int64_t nb0 = (int64_t) lay.blob_bytes(pairs[0].first);
+            const uint8_t* b0 = blob_at(pairs[0].first, pairs[0].second, nb0);
+            if (filled > 0 && !cache.verify_slot(cache.slot_of(pairs[0].first, pairs[0].second), b0, why, nb0)) {
+                why = std::string(who) + ": " + why;
+                return false;
+            }
+        }
+        std::fprintf(stderr, "strata generate: %s: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
+                     who, (long long) filled, (long long) (per_layer ? cache.slots() : want));
+        return true;
+    };
+    std::vector<std::string> fill_err(stages.size() + 1);
+    std::vector<std::string> fill_who(stages.size() + 1);
+    fill_who[0] = "CUDA0";
+    for (size_t i = 0; i < stages.size(); ++i) fill_who[i + 1] = "CUDA" + std::to_string(stages[i]->dev);
+    bool fill_ok = true;
+    if (o.all_experts_vram && !stages.empty()) {
+        std::vector<std::thread> fill_threads;
+        fill_threads.reserve(stages.size());
+        for (size_t i = 0; i < stages.size(); ++i) {
+            GpuStage& st = *stages[i];
+            fill_threads.emplace_back([&st, &fill_tier, &fill_err, &fill_who, i] {
+                if (!fill_tier(st.cache, st.dev, st.profile, fill_who[i + 1].c_str(), fill_err[i + 1], true))
+                    fill_err[i + 1] = fill_err[i + 1].empty() ? "fill stopped" : fill_err[i + 1];
+            });
+        }
+        fill_ok = fill_tier(xcache, 0, profile, fill_who[0].c_str(), fill_err[0]);
+        for (auto& t : fill_threads) t.join();
+        for (const std::string& e : fill_err)
+            if (!e.empty()) fill_ok = false;
+    } else {
+        fill_ok = fill_tier(xcache, 0, profile, fill_who[0].c_str(), fill_err[0]);
+        for (size_t i = 0; fill_ok && i < stages.size(); ++i)
+            fill_ok = fill_tier(stages[i]->cache, (int) stages[i]->dev, stages[i]->profile,
+                                fill_who[i + 1].c_str(), fill_err[i + 1], true);
+    }
+    if (!fill_ok) {
+        for (const std::string& e : fill_err)
+            if (!e.empty()) { std::fprintf(stderr, "strata generate: %s\n", e.c_str()); break; }
+        return 1;
+    }
+    mem_mark("the profile fill");
+
+    for (auto& stp : stages) {
+        GpuStage& st = *stp;
         std::fprintf(stderr, "strata generate: layer split: CUDA%d runs layers %lld-%lld, expert cache %lld slots "
                              "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified\n",
                      st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
-                     (long long) filled, st.profile.size());
+                     (long long) st.cache.resident(), st.profile.size());
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
+    // ---- --all-experts-vram: PROVE the promise before serving a single token.
+    //
+    // Every other mode degrades: an expert no cache holds is computed by the CPU pool or read over the link, and
+    // the run is merely slower.  Here the whole point is that no expert is ever missing, so a cache that filled
+    // short has to stop the run rather than serve a token that quietly differs from the one this mode exists to
+    // make fast.  The check is the pair count the pack actually has (layers x experts), not the profile's length -
+    // a profile that ranks 8,000 of 24,576 experts cannot complete the tier, and saying so beats a 33% hit rate.
+    if (o.all_experts_vram) {
+        const int64_t want = g.n_layers * g.n_expert;
+        int64_t have = xcache.resident();
+        uint64_t short_bytes = 0;
+        int64_t short_pairs = 0;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        auto tally = [&](const std::vector<std::pair<int32_t, int32_t>>& pairs, strata::core::ExpertCache& cache) {
+            for (const auto& pr : pairs)
+                if (cache.slot_of(pr.first, pr.second) < 0) {
+                    ++short_pairs;
+                    short_bytes += (uint64_t) ((lay.blob_bytes(pr.first) + 255) / 256 * 256);
+                }
+        };
+        tally(profile, xcache);
+        for (auto& stp : stages) {
+            have += stp->cache.resident();
+            tally(stp->profile, stp->cache);
+        }
+        if (have < want) {
+            const int64_t cards = 1 + (int64_t) stages.size();
+            std::fprintf(stderr, "strata generate: --all-experts-vram: %lld of %lld experts are in VRAM; the other "
+                                 "%lld need %.2f GiB more (%.2f GiB per card over %lld cards).\n",
+                         (long long) have, (long long) want, (long long) (want - have),
+                         (double) short_bytes / 1073741824.0, (double) short_bytes / 1073741824.0 / (double) cards,
+                         (long long) cards);
+            std::fprintf(stderr, "strata generate: make room with a shorter --max-context, a smaller KV cache "
+                                 "(--kv int8, q4_0 or k8v4), another card in --gpus, or a smaller --prefill chunk; "
+                                 "drop --all-experts-vram to let the rest stay in RAM.\n");
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: --all-experts-vram: all %lld experts are in VRAM (%.2f GiB of slots "
+                             "over %lld card%s); no expert is read from RAM or the SSD while it answers\n",
+                     (long long) have, xcache.gib() + [&] { double d = 0; for (auto& s : stages) d += s->cache.gib(); return d; }(),
+                     (long long) (1 + (int64_t) stages.size()), stages.empty() ? "" : "s");
+    }
 
     std::array<strata::core::RemoteExperts, 3> remote_experts;
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;

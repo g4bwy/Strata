@@ -446,6 +446,17 @@ uint64_t gdn_set_bytes(size_t T) {
     a.take<float>(T * HV, ok); a.take<float>(T * C, ok); a.take<float>(T * ZV, ok); a.take<uint16_t>(T * ZV, ok);
     return a.used;
 }
+/// How many query rows one QSA selection pass scores at once.  The buffer it needs is `sel_batch x max_blocks`
+/// floats, and `max_blocks` is a quarter of the context: 256 rows cost 67 MiB at the trained 262,144 positions
+/// (where it is what every shipped run has always used) but 268 MiB at 1M, per card.  Past that the batch
+/// halves, which only means more launches of the same kernel over the same rows - the selection itself is a
+/// per-row top-k and does not care how the rows are grouped.  Below 262K nothing changes, by construction.
+int64_t sel_batch_for(int64_t max_blocks) {
+    int64_t b = 256;
+    while (b > 16 && (uint64_t) b * (uint64_t) std::max<int64_t>(max_blocks, 1) * sizeof(float) > (72ull << 20))
+        b /= 2;
+    return b;
+}
 uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_batch, int64_t attn_batch,
                        const strata::kernels::QsaShapes& s) {
     Alloc a; a.count_only = true; bool ok = true;
@@ -646,6 +657,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     s.idx_dim = g.idx_key_dim;
     m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     m.max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
+    m.sel_batch = sel_batch_for(m.max_blocks);   // a long context would otherwise price the buffer by the whole context
     {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
         const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
@@ -903,7 +915,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     s.idx_dim = g.idx_key_dim;
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
-    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
+    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, sel_batch_for(max_blocks), 32, s),
                                        moe_set_bytes(T, g.n_expert)}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {

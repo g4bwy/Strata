@@ -1523,6 +1523,19 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
             d.fail_expert = e;
             return;
         }
+        // A HIT IS ANSWERED BEFORE THE SOURCE IS ASKED.  `blob()` on the mapped (low-RAM / all-on-GPU) source
+        // assembles the blob, and assembling means reading it: on the file-in-place mode that is three pread
+        // calls of a megabytes-sized slice for an expert the GPU already has.  Asked first, as it used to be, a
+        // run whose cache holds every expert still read every routed expert from the SSD on every token - the
+        // bytes only went into a buffer nobody then used.
+        if (use_hits && (graph_hits ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0
+                                    : d.is_hit[(size_t) i] != 0)) {
+            if (graph_hits) ++d.cache_hits;
+            // The GPU owns this row and `hit_out` is zeroed, so the CPU's contribution is zero - but
+            // `y_miss` is a REUSED pinned buffer, so the row must be written, not merely skipped.
+            std::memset(out + (size_t) i * (size_t) n_embd, 0, (size_t) n_embd * sizeof(float));
+            continue;
+        }
         const uint8_t* b = d.src->blob(d.layers, e);
         if (b == nullptr) {
             // The one failure the loop cannot see.  Leaving `out` at its previous contents would feed the NEXT
@@ -1534,15 +1547,6 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
             d.fail_expert = e;
             ++d.missing;
             return;
-        }
-        // A hit's row was zeroed by `Launch` and belongs to the GPU; the pool must not touch it.
-        if (use_hits && (graph_hits ? d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0
-                                    : d.is_hit[(size_t) i] != 0)) {
-            if (graph_hits) ++d.cache_hits;
-            // The GPU owns this row and `hit_out` is zeroed, so the CPU's contribution is zero - but
-            // `y_miss` is a REUSED pinned buffer, so the row must be written, not merely skipped.
-            std::memset(out + (size_t) i * (size_t) n_embd, 0, (size_t) n_embd * sizeof(float));
-            continue;
         }
         if (graph_hits) ++d.cache_refused;   // token graph: a miss (nothing is admitted during a token)
 

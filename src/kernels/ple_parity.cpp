@@ -1177,6 +1177,38 @@ int main(int argc, char** argv) {
                     cap.nt - 1, num / terms, res / terms);
     }
 
+    // ---- a Q8_0 row, checked against fp16 bits from outside this project -----------------------------
+    //
+    // Unsloth's Q8_0 release stores the n-gram table itself as Q8_0, so one row is five blocks of {fp16 scale,
+    // 32 signed int8 codes} = 170 bytes, and `value = d * code` with no codebook and no offset.  The scale bits
+    // below are what Python's `struct.pack("<e", v)` gives for those five values (0x3800, 0xb400, 0x3c00,
+    // 0x0000, 0x2600), so the test's own converter is not what is being checked, and one of them is exactly the
+    // 0x2600 pattern f16_bits.hpp was written because a `__half` read got wrong.  A zero scale is in the set on
+    // purpose: the block it belongs to must come out all zeros rather than all garbage.
+    {
+        const uint16_t hbs[5] = {0x3800, 0xb400, 0x3c00, 0x0000, 0x2600};
+        const float scl[5] = {0.5f, -0.25f, 1.0f, 0.0f, 3.0f / 128.0f};
+        std::vector<uint8_t> row((size_t) k::PLE_ROW_BYTES_Q8_0, 0);
+        for (int b = 0; b < 5; ++b) {
+            std::memcpy(&row[(size_t) b * 34], &hbs[b], 2);
+            for (int j = 0; j < 32; ++j) row[(size_t) b * 34 + 2 + j] = (uint8_t) (int8_t) (j - 16 + b);
+        }
+        std::vector<float> got((size_t) k::PLE_HEAD_DIM);
+        k::q8_0_dequant_row(row.data(), got.data());
+        double worst = 0;
+        long long nfall = 0;
+        for (int i = 0; i < k::PLE_HEAD_DIM; ++i) {
+            const double want = (double) scl[i / 32] * (double) (int8_t) (i % 32 - 16 + i / 32);
+            if (!std::isfinite(got[i])) { ++nfall; continue; }
+            const double e = std::fabs(want - (double) got[i]);
+            if (worst < e) worst = e;
+        }
+        const bool exact = worst == 0.0 && nfall == 0 && k::PLE_ROW_BYTES_Q8_0 == 170;
+        std::printf("  %-46s %s (170 B a row, worst |err| %.3g over 160 values, non-finite %lld)\n",
+                    "Q8_0 row decodes to scale x code exactly", exact ? "yes" : "*** NO ***", worst, nfall);
+        if (!exact) ++bad;
+    }
+
     std::printf("\nple_parity: %d failures (worst stage rel %.3e)\n", bad, worst_all);
     if (bad) return 1;
     if (selftest) std::printf("ple_parity OK\n");

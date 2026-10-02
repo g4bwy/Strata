@@ -123,6 +123,20 @@ NVIDIA GPU (no images yet). Details and measurements: [UD-Q4_K_XL](UNSLOTH_Q4.md
 START-HERE.bat --setup --family unsloth --model UD-Q4_K_XL
 ```
 
+### Unsloth Q8_0 (experimental, needs ~185 GB of VRAM)
+
+**Unsloth's 8-bit Q8_0** is the same repository's other size, and a different problem: its experts are 128 GB,
+too many for any PC's RAM and few enough for a few big cards. Strata then keeps all 24,576 of them on the GPUs
+(`--all-experts-vram`), with no RAM copy and no expert read while it answers. Setup writes that configuration
+when your cards hold it and stops when they do not. It needs about 185 GB of VRAM between at least three cards,
+and it is configured for a context of up to 1M with the unquantized fp16 KV cache. The n-gram table (54 GB at
+8 bits) is the one thing that stays in host RAM. Nothing about it is measured on hardware yet: the sizes on
+[Q8_0](UNSLOTH_Q8.md) are computed, and the page says which.
+
+```
+START-HERE.bat --setup --family unsloth --model Q8_0 --context 1048576 --gpus 0,1,2,3
+```
+
 ### OrcaRouter Uncensored IQ3_XXS
 
 For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](ORCA.md). It needs an

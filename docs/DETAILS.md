@@ -75,6 +75,20 @@ VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the
 slower. It does not stream its KV cache (KV streaming is on by default from 64K), so it pays off mostly on large
 cards at long contexts.
 
+**Everything on the GPU (engine 0.1.35, `--all-experts-vram`):** for a PC with more VRAM than the model's experts
+need, the engine keeps all 24,576 routed experts on the cards and allocates no host arena at all. It then implies
+`--mmap-experts` (the bytes go from the model's file straight into the cache slots once, at start),
+`--pcie-frac 0`, `--adapt-swaps 0`, and prompt buffers of its own instead of borrowed cache slots, and it refuses
+the start when the cards cannot hold every expert, naming the GiB short. Setup writes it for Unsloth's 8-bit file
+when the cards are big enough. The n-gram table is the one part of the model that stays in host RAM
+(`--ple-io ram`, or `mmap` / `direct` on a smaller PC). Sizes, the four-card layout and what is not measured:
+[UNSLOTH_Q8.md](UNSLOTH_Q8.md).
+
+**fp16 KV at any length (`--kv fp16`):** the engine always accepted it, and setup now offers it: full precision K
+and V, 2,048 B per position per QSA layer against int8's 1,056. It is the default below 8K as it was, the choice
+for a model whose experts are all resident, and worth nothing on a 12 GB card, where the cache's own bytes are
+the room the expert cache needs.
+
 **Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
 expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
 slightly differently. How many tokens share an expert depends on the drafts in a verify window, so the same prompt
@@ -252,6 +266,19 @@ does and the manual workflow are in **[docs/UNSLOTH_Q4.md](UNSLOTH_Q4.md)**. On 
 tokens/s, most experts read from the SSD; it picks the same tokens as llama.cpp on the same file at 97.5-99% of
 the positions of short greedy answers, 90-91% after a 16K prompt, differing mostly at near-ties
 ([measured](UNSLOTH_Q4.md#quality-against-llamacpp-on-the-same-file)).
+
+### Experimental: Unsloth's Q8_0 (a GPU-first PC)
+
+An 8-bit quantization of the same model (188 GB, 128 GB of experts, a 54 GB n-gram table). Its experts are too
+many for any PC's RAM and few enough for four big cards, so setup configures it a different way: every expert on
+a GPU (`--all-experts-vram`), no host arena, a 1M context and the unquantized fp16 KV cache, with the table in
+host RAM. It needs about 185 GB of VRAM between at least three cards, and setup refuses before the download when
+they cannot hold it. Nothing about this configuration is measured yet, and
+**[docs/UNSLOTH_Q8.md](UNSLOTH_Q8.md)** says which numbers are computed.
+
+```
+START-HERE.bat --setup --family unsloth --model Q8_0 --context 1048576 --gpus 0,1,2,3
+```
 
 ## Before you start
 

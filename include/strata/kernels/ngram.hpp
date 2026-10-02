@@ -46,7 +46,10 @@ inline constexpr float NG_RMS_EPS = 1e-6f;
 inline constexpr uint64_t PLE_TABLE_ROWS = 320001536ull;
 inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90: an IQ4_NL row
 inline constexpr int PLE_ROW_BYTES_FP8 = PLE_HEAD_DIM;                   // 160: an F8_E4M3 row, one byte a value
-inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_FP8;
+/// A Q8_0 row: 5 blocks of 32 at 34 bytes (32 codes + one fp16 scale).  Unsloth's Q8_0 release stores the table
+/// this way, and it is the reason the row buffer is sized from the widest format rather than the common one.
+inline constexpr int PLE_ROW_BYTES_Q8_0 = (PLE_HEAD_DIM / 32) * 34;      // 170: a Q8_0 row
+inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_Q8_0;
 
 /// The artifact's own hash constants, transcribed from `docs/gguf-dump-shard1.txt`:
 ///
@@ -102,6 +105,12 @@ void iq4nl_dequant_row(const uint8_t* row, float* out160);
 /// table's one scale. This is the table as Qwen3.8-Flash-Next ships it (`...ngram_embedding.shard_k`, F8_E4M3, and
 /// `weight_scale`), kept byte for byte by tools/ple_fp8_pack.py; IQ4_NL is 8% off it per row.
 void fp8_e4m3_dequant_row(const uint8_t* row, float scale, float* out160);
+
+/// One Q8_0 row -> 160 floats: 5 blocks of 34 bytes, each one fp16 scale followed by 32 signed codes,
+/// `value = d * code`.  This is how Unsloth's Q8_0 release stores the table (`Q8_0` everywhere), and the reason
+/// `PLE_ROW_BYTES_MAX` is the widest row rather than the common one.  Unlike IQ4_NL there is no codebook: the
+/// code is the value, so the only rounding is the fp16 scale.
+void q8_0_dequant_row(const uint8_t* row, float* out160);
 
 /// How the table's rows are read (plan v0.3 P2). `Direct` is the default: unbuffered 4 KiB reads from the SSD,
 /// so the table never occupies RAM or the OS file cache. `Mmap` is the earlier memory-mapped path, kept as the

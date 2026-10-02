@@ -1,4 +1,4 @@
-# Strata on two or three GPUs (layer split)
+# Strata on two or more GPUs (layer split)
 
 One model can run across several NVIDIA cards in one PC. The layers are split into contiguous ranges, one per GPU:
 the first card runs layers 0 to K-1, the next card runs K onward, and so on; the last card also runs the output head
@@ -86,9 +86,14 @@ strata serve: layer split: layers 0-18 (CUDA0), 19-47 (CUDA1), one hand-off per 
 ## What each card holds
 
 - **every card**: a copy of the dense weights (~3.4 GB for the Coder), its own session state (the KV cache of the full
-  context), its verify window and its prompt-path buffers, and an expert cache for its layers filled from the profile;
-- **the last card**: also the output head and the draft layer (~0.8 GB);
+  context, for the QSA layers it runs: 2,048 B per position per layer with `--kv fp16`, 1,056 B with `--kv int8`),
+  its verify window and its prompt-path buffers, and an expert cache for its layers filled from the profile;
+- **the last card**: also the output head and the draft layer (~0.8 GB), and the draft layer's own KV pool;
 - **host RAM**: the expert arena once, shared by all cards (the CPU pool computes whatever no card holds).
+
+The last line is what `--all-experts-vram` changes: when the cards hold every expert there is no arena, and RAM
+holds the n-gram table and nothing else of the model. Four 64 GB cards with Unsloth's 8-bit file is that case:
+[UNSLOTH_Q8.md](UNSLOTH_Q8.md).
 
 Prompts are read in chunks that flow through the cards in turn; while a later card reads chunk c, the first card
 already reads chunk c+1. Conversation checkpoints save and restore every card's state; the adaptive expert swaps copy
@@ -106,8 +111,10 @@ into the card that owns the layer.
   - the older helper-GPU caches (`--expert-cache-remote`, docs/SECOND_GPU.md): they take the visible GPUs no stage
     runs on, and hold only experts no stage's cache holds. On the test rig, a 2080 Ti helper made decoding slower,
     as it did without a split: its per-layer round trip costs more than the CPU pool needs for those experts.
-- `--mmap-experts` needs a canonical pack (`experts.bin`), with or without a split; a native (IQ) pack says so at
-  start.
+- `--mmap-experts` needs a pack it can read the experts from: a canonical pack's `experts.bin`, or a native (IQ)
+  pack's own GGUF shards in place (engine 0.1.31, `native_experts.txt`). Both work with or without a split. The
+  one thing it cannot do is a native pack whose shards are not where `--native` says they are: the start names
+  the missing file.
 - The prompt path has its own buffers on every card (1.5 GB each at the default 2048-token chunk; `--prefill 1024`
   halves that) instead of borrowing cache slots as one card does. An explicit `--expert-cache` on the first card is
   capped to leave room for them.
@@ -138,4 +145,11 @@ The Coder on an RTX 5080 + RTX 3090 (Ryzen 9 9950X3D), 32K context; details in
 - Put the fastest card first; auto gives it as many layers as its cache allows.
 - Leave out a much slower card when two already hold the model. An RTX 2080 Ti as a third card made the 5080 +
   3090 pair slower (68 / 90 tok/s decode): every extra card costs its own round per window.
-- More cards pay off when the model's routed experts do not fit the faster ones.
+- More cards pay off when the model's routed experts do not fit the faster ones. Four cards are supported:
+  `SplitDrive::kMax` is 8 stages, and `--layer-split auto` places beyond three cards in proportion to each card's
+  free VRAM. A 4 x 64 GB rig with every expert resident runs 12 layers per card, and at start the cards fill their
+  caches at the same time (0.1.35), because the fill is bound by each card's own link.
+- A thin link is not a reason to avoid a split, and a big card is not a reason to stream. A Q8_0 expert is
+  5.22 MB, so it crosses a Gen1 x4 link (about 1 GB/s, the electrical width of a CMP 170HX) in 5.2 ms. The engine
+  probes each stage's link and sets that stage's PCIe share to 0 below about 4 GB/s, so a slow-linked card stops
+  reading experts over the link instead of waiting on them.

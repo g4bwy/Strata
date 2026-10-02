@@ -62,6 +62,10 @@ FALLBACK_MODELS = {
     "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but most experts come from the "
                             "SSD on a 64 GB PC (7-8.5 tokens/s measured)", "download_gb": 111.3, "ram_gb": 48,
                    "arena_gb": 77.0, "families": ("unsloth",), "budget": True},
+    "Q8_0": {"about": "8-bit (Unsloth): every expert stays on the GPU, so it needs ~185 GB of VRAM between at "
+                      "least three big cards; nothing else works with less", "download_gb": 188.3, "ram_gb": 64,
+             "arena_gb": 128.3, "families": ("unsloth",), "vram_only": True, "shards": 0,
+             "expert_bytes": 5222400, "ple_bytes": 54400261120},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -69,11 +73,11 @@ FALLBACK_FAMILIES = {
                                              "authors' numbers)", "tag": "swift-"},
     "coder": {"title": "Qwen3.8-Flash-Next Coder", "about": "half the experts (code, tools, images kept): needs ~32 GB "
                                                             "of RAM, faster; weaker outside coding", "tag": "coder-"},
-    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "4-bit, 111 GB download, most experts read from the "
-                                                                  "SSD: slow (7-8.5 tokens/s on a 64 GB PC)",
+    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "4-bit (slow, most experts from the SSD) or 8-bit "
+                                                                  "(every expert on the GPU: ~120 GiB of VRAM)",
                 "tag": "unsloth-", "experimental": True, "vision": False},
 }
-FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288]
+FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288, 1048576]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "
                 "Plain prose, no title.")
 
@@ -955,8 +959,9 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "vision": {"type": "string", "enum": ["no", "yes", "gpu", "cpu"],
                         "description": "let the model read images (yes = the encoder on the GPU; ~0.9 GB more "
                                        "download); default no"},
-             "kv": {"type": "string", "enum": ["int8", "q4_0", "k8v4"],
-                    "description": "KV cache precision above 8K context (default int8)"},
+             "kv": {"type": "string", "enum": ["int8", "fp16", "q4_0", "k8v4"],
+                    "description": "KV cache precision above 8K context (default int8; fp16 is full precision and "
+                                    "what a model with every expert on the GPU gets by default)"},
              "gpu": {"type": "integer", "minimum": 0, "maximum": 63,
                      "description": "one GPU, as nvidia-smi numbers them (default: the one with the most VRAM)"},
              "gpus": {"type": "string", "pattern": GPUS_PATTERN, "maxLength": 40,

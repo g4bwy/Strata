@@ -74,6 +74,11 @@ By the PC's RAM (ask the user whether they mainly want it for code - then the Co
 | 64 GB | `--family qwen --model IQ2_XS` (recommended) | `IQ3_XXS` / `IQ3_S` are slower and a bit better |
 | 96 GB+ | `--family qwen --model IQ3_S` | `--family unsloth --model UD-Q4_K_XL` is experimental: NVIDIA only, NVMe SSD, 7-8.5 tokens/s on 64 GB |
 
+VRAM opens a second axis. With about 185 GB of it between at least three cards, `--family unsloth --model Q8_0`
+keeps every
+expert on the GPUs (no RAM tier, no SSD reads while it answers). Check the cards before offering it: setup
+refuses the model when they cannot hold it, and it refuses before it downloads 188 GB.
+
 `--family swift` (Swift 1.5, a fine-tune that thinks shorter; sizes Q2_0, IQ2_XS, IQ3_XXS) is the alternative to
 `qwen`. With `--yes` and no `--model`, setup picks the recommended size for the RAM itself. More: [MODELS.md](MODELS.md).
 
@@ -92,8 +97,9 @@ The flags (all of them: `START-HERE.bat --help`):
 | --- | --- |
 | `--yes` | take the recommended answer to every question (no prompts) |
 | `--family qwen\|swift\|coder\|unsloth` | the model version |
-| `--model Q2_0\|IQ2_XS\|IQ3_XXS\|IQ3_S\|IQ1_M\|UD-Q4_K_XL` | the size (the Coder is IQ1_M, Unsloth UD-Q4_K_XL) |
-| `--context N` | context in tokens; default by VRAM: 32768 under 14 GB, 65536 under 20 GB, else 131072 |
+| `--model Q2_0\|IQ2_XS\|IQ3_XXS\|IQ3_S\|IQ1_M\|UD-Q4_K_XL\|Q8_0` | the size (the Coder is IQ1_M; Unsloth is UD-Q4_K_XL or Q8_0) |
+| `--context N` | context in tokens; default by VRAM: 32768 under 14 GB, 65536 under 20 GB, else 131072. For a model with every expert resident it is the longest context whose plan fits the cards, up to 1048576 |
+| `--kv fp16\|int8\|q4_0\|k8v4` | KV cache precision above 8K: fp16 is full precision (2,048 B a token per layer), int8 the default, q4_0 the smallest |
 | `--vision yes\|no\|gpu\|cpu` | read pictures; `--yes` leaves images off. AMD cards: `cpu` |
 | `--gpu N` / `--gpus 0,1` / `--gpus all` | one card, or several sharing the model (default: the card with the most VRAM) |
 | `--backend cuda\|hip` | NVIDIA or AMD engine; chosen by itself on a PC with only one kind of card |

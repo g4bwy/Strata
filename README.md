@@ -102,12 +102,19 @@ is faster, larger is a bit smarter.
 | **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best, and the slowest |
 | **96 GB or more** | **IQ3_S**, or Unsloth's 4-bit (experimental) | room for the largest sizes with everything else open |
 
+RAM picks the size, and VRAM picks the mode. With about 185 GB of VRAM between at least three cards you can instead take
+Unsloth's **8-bit** file and keep every expert on the GPUs, with no RAM tier at all
+([docs/UNSLOTH_Q8.md](docs/UNSLOTH_Q8.md)).
+
 - **[Coder](docs/MODELS.md#coder)** - a coding version with half of the experts removed: 91% of the full model's
   SWE-bench Verified score (by its authors), fits 32 GB of RAM. Weaker outside coding.
 - **[Swift 1.5](docs/MODELS.md#swift-15)** - a fine-tune that thinks much shorter before it answers, so you get the
   answer sooner, at about the same quality.
 - **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental) - the closest to the full
   model, but most of it is read from the SSD while it answers: 7-8.5 tokens/s on a 64 GB PC.
+- **[Unsloth Q8_0](docs/MODELS.md#unsloth-q8_0-experimental-needs-185-gb-of-vram)** (experimental) - 8-bit, and the
+  other way round: nothing is read while it answers, because all 24,576 experts sit on the cards. Needs about
+  185 GB of VRAM between at least three cards. Not measured on hardware yet.
 - **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs)** - a manual setup, not in the
   installer's menu.
 

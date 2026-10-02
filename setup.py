@@ -118,6 +118,18 @@ MODELS = {
     "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but most experts come from the "
                             "SSD on a 64 GB PC (7-8.5 tokens/s measured)", "download_gb": 111.3, "ram_gb": 48,
                    "arena_gb": 77.0, "families": ("unsloth",), "budget": True},
+    # Unsloth's 8-bit file (docs/UNSLOTH_Q8.md).  Its experts are 128.35 GB and there is no PC with that much RAM
+    # beside the 54 GB n-gram table, so setup configures it one way only: every expert on a GPU (--all-experts-vram),
+    # the table in host RAM.  The sizes are derived, not measured (the same arithmetic `strata generate` does at
+    # load): one expert is gate + up + down = 640x2560 + 640x2560 + 2560x640 = 4,915,200 values, a Q8_0 block is 34
+    # bytes of 32 values, so 5,222,400 B an expert and 24,576 x 5,222,400 = 128.35 GB.  The download adds the
+    # n-gram table (320,001,536 rows x 170 B = 54.40 GB) and the ~5.5 GB of dense weights the 4-bit file's own
+    # 111.33 GB total implies (111.33 - 77.0 experts - 28.8 IQ4_NL table).  "shards": 0 means the file count is read
+    # from the repository at setup time: Unsloth splits a release by size, so a bigger quantization has more files.
+    "Q8_0": {"about": "8-bit (Unsloth): every expert stays on the GPU, so it needs ~185 GB of VRAM between at least "
+                      "three big cards; nothing else works with less", "download_gb": 188.3, "ram_gb": 64, "arena_gb": 128.3,
+             "families": ("unsloth",), "vram_only": True, "shards": 0, "expert_bytes": 5222400,
+             "ple_bytes": 54400261120},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
@@ -132,13 +144,16 @@ UNSLOTH_SHARDS = {
         (12087983520, "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a"),
 }
 UNSLOTH_ENGINE = (0, 1, 32)     # the first engine setup configures for UD-Q4_K_XL (0.1.31 ran it by hand)
+ALL_VRAM_ENGINE = (0, 1, 35)    # the first engine with --all-experts-vram and an 8-bit n-gram table, the two things
+                                # Unsloth's Q8_0 file needs (0.1.34 has kernels for its experts but no way to keep
+                                # all of them on the GPU without a host copy as large as the model)
 UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
 # Contexts past 262144 (the model's trained length) extend it by rope scaling: for the context it will
 # serve the setup resolves the method (yarn, or one question when interactive) and derives the factor
 # from the final context (final / 262144, at least 1) itself (below), keeps an explicit
 # --rope-scaling/--rope-scale, and refuses an explicit --rope-scaling none there - the stock angles past
 # the trained range are out of spec.
-CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288]
+CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288, 1048576]
 # The model families: the same architecture, weights in the same three GSQ-RCO sizes, different files.
 FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "by": "Qwen; GSQ-RCO quants by ISTA-DASLab",
@@ -775,6 +790,42 @@ def whole_shard(s: Path) -> bool:
 
 
 SHARD_NAME = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+
+HF_URL = re.compile(r"https://huggingface\.co/([^/]+/[^/]+)/(resolve|tree)/([^/]+)/?")
+
+
+def hf_repo_revision(url: str) -> tuple[str, str] | None:
+    """The repository and the revision a `hf()` download URL points at.  Setup keeps both in one string (that is
+    what a download needs), and the file listing needs them apart."""
+    m = HF_URL.match(url)
+    return (m.group(1), m.group(3)) if m and m.group(2) == "resolve" else None
+
+
+def hf_tree_files(url: str, sub: str) -> dict[str, int] | None:
+    """The files of one folder of a Hugging Face repository, name -> bytes, read from the repository's own tree
+    API at the same revision the downloads come from.  None when the listing cannot be read (no network, a folder
+    that is not there, a response that is not JSON).
+
+    This exists because Unsloth splits its releases by file size rather than by layer count, so the number of
+    shards a quantization has is a property of the quantization: setup has no list to guess it from and no business
+    hard-coding names it cannot check.  The pinned sizes and hashes in MODELS[..]["shards"] stay the rule where
+    they exist; this is the fallback for the quantizations nobody has pinned yet."""
+    got = hf_repo_revision(url)
+    if got is None:
+        return None
+    repo, rev = got
+    api = f"https://huggingface.co/api/models/{repo}/tree/{rev}/{sub.strip('/')}"
+    try:
+        import urllib.request
+        with urllib.request.urlopen(urllib.request.Request(api, headers={"User-Agent": "strata-setup"}),
+                                    timeout=30) as r:
+            entries = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:                       # any failure means "no listing", and setup says what it used
+        say(f"  {api}: {type(e).__name__}: {e}")
+        return None
+    out = {e["path"].rsplit("/", 1)[-1]: int(e.get("size") or 0) for e in entries
+           if isinstance(e, dict) and e.get("type") == "file" and e["path"].endswith(".gguf")}
+    return out or None
 
 
 def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
@@ -1862,6 +1913,114 @@ LOW_RAM_HEADROOM_GB = 10   # RAM beside the experts: the OS, the engine's other 
 RESIDENT_ENGINE = (0, 1, 30)   # the first engine with --resident-experts (the low-RAM mode's resident variant)
 
 
+# ---- everything on the GPU: what one card has to hold -----------------------------------------------
+#
+# The arithmetic `strata generate` does at load, kept here so the setup can plan before it downloads 188 GB.
+# Every constant names where the engine computes it.
+KV_BYTES_PER_CELL = {"fp16": 2048, "int8": 1056, "k8v4": 816, "q4_0": 576}   # layer.cpp:514 kv_pool_bytes()
+KV_POOLS = 13                     # the 12 QSA layers + the draft layer's own pool
+KV_INDEX_PER_CELL = 128 // 4      # layer.cpp:541: one 128-float fp32 indexer key per 4-token block
+KV_ROPE_PER_TOKEN = 32 * 4 * 2    # layer.cpp:543: 32 rotary pairs, cos and sin, fp32 - one table per card
+N_LAYERS, QSA_EVERY = 48, 4       # layout.hpp:29,30 - layer % 4 == 3 is full attention
+DENSE_GB = 5.5                    # every card's own copy of the non-expert weights, the head and the embedding
+                                  # included: derived from Unsloth's 4-bit release, whose 111.33 GB are 77.0 of
+                                  # experts + 28.8 of IQ4_NL n-gram table + 5.5 of everything else, all of it
+                                  # already stored at 8 bits (docs/MULTI_GPU.md:88 calls it "~3.4 GB for the Coder")
+PROMPT_BUFFER_GB = 2.0            # the prompt path's own chunk buffers (docs/MULTI_GPU.md:111: 1.5 GB at the
+                                  # default 2048-token chunk, plus the 160 MiB the engine prices separately)
+MTP_GB = 1.5                      # the draft layer's weights, on the last card only (docs/MULTI_GPU.md:90 says
+                                  # 0.8 GB for head + draft together at 4 bits; the head is in DENSE_GB here, and
+                                  # the draft's own file is ~6 GB on disk, so this is the wider figure)
+CARD_RESERVE_GB = 1.0             # --vram-reserve-mib 700 plus the verify windows (96 MiB), rounded up
+
+
+def kv_token_bytes(kv: str) -> int:
+    """What one token of context costs in the caches that grow with it: the K and V pools of the 12 QSA layers
+    and the draft layer's own (13 pools, `src/core/layer.cpp:514 kv_pool_bytes()`).  fp16 stores both halves as
+    they come out of the projection (2 x 2 heads x 256 values x 2 bytes); the smaller formats quantize them, and
+    int8's 1,056 is not half of 2,048 because its per-group scales have no fp16 equivalent to lose.  The indexer's
+    pooled keys (128 B per token per layer) and the rope table (256 B per token) are NOT in this figure: the
+    estimates that use it have always left them out, and they are under 12% of it."""
+    return KV_POOLS * KV_BYTES_PER_CELL[kv]
+
+
+def ple_tier(ple_gb: float, ram: float) -> str:
+    """Where the n-gram table lives: `ram` locks the whole of it in RAM at start (Linux only - the engine
+    refuses the flag on Windows, which has no mlock), `mmap` leaves it in the OS file cache where it can be given
+    back, and `direct` never maps it at all and reads each token's 16 rows from the SSD.  RAM is the fastest of
+    the three and the only one that costs a machine: 54 GB of table on a 64 GB PC is a PC with nothing left for
+    the OS, so the choice is made from the table's size and the RAM beside it."""
+    if not WIN and ram >= ple_gb + 12:
+        return "ram"
+    if ram >= ple_gb + LOW_RAM_HEADROOM_GB:
+        return "mmap"
+    return "direct"
+
+
+def qsa_layers(lo: int, hi: int) -> int:
+    """How many of layers [lo, hi) are full-attention (QSA) layers, so hold a KV cache."""
+    return hi // QSA_EVERY - lo // QSA_EVERY
+
+
+def layer_ranges(n_layers: int, cards: list[float]) -> list[tuple[int, int]]:
+    """Split `n_layers` over the cards in proportion to their VRAM, at least one layer each, in card order.  The
+    engine searches its own boundaries (--layer-split auto, generate.cpp:2394); this is the same idea at the
+    granularity a plan needs before anything is loaded, and it keeps 48 % 4 == 0 splits on the 4-layer boundary so
+    each card's QSA count is exact."""
+    vram = sum(cards) or 1.0
+    cuts, seen = [], 0.0
+    for i, c in enumerate(cards[:-1]):
+        seen += c / vram
+        k = int(round(seen * n_layers))
+        k = max(k, (i + 1) * 2, (seen * n_layers // QSA_EVERY) * QSA_EVERY if n_layers % QSA_EVERY == 0 else k)
+        cuts.append(min(max(k, 1), n_layers - 1))
+    cuts = sorted(set(cuts))
+    bounds = [0] + cuts + [n_layers]
+    return list(zip(bounds, bounds[1:]))
+
+
+def vram_resident_plan(model: str, cards: list[float], ctx: int, kv: str = "fp16") -> dict:
+    """What each card would hold with every expert of `model` on a GPU: its share of the experts, the whole
+    context's KV cache for the QSA layers it runs, its own dense weights, its prompt buffers, and on the last
+    card the head and the draft layer.  Returns per-card need and room, and whether all of it fits.
+
+    `cards` are the sizes `gpus()` reports - GiB, from nvidia-smi's MiB - and every need is decimal GB, the unit
+    MODELS[..]["arena_gb"] and the engine's own byte counts use, so the room is converted here (1 GiB = 1.0737 GB)
+    rather than the two being compared as if they were the same thing.
+
+    This is a plan, not a promise: the engine re-measures each card at load (`cudaMemGetInfo`) and refuses a
+    cache it cannot honour - which is the check that matters.  Setup uses this to choose the split and the
+    context, and to say the same numbers in its own report."""
+    m = MODELS[model]
+    per = layer_ranges(N_LAYERS, cards)
+    out, fits = [], True
+    for i, ((lo, hi), room_gib) in enumerate(zip(per, cards)):
+        room = room_gib * 1.073741824
+        share = (hi - lo) / N_LAYERS
+        exp = m["arena_gb"] * share
+        pools = qsa_layers(lo, hi) + (1 if i == len(per) - 1 else 0)      # the draft layer's pool is on the last
+        cache = pools * ctx * (KV_BYTES_PER_CELL[kv] + KV_INDEX_PER_CELL) / 1e9
+        rope = ctx * KV_ROPE_PER_TOKEN / 1e9 if i == len(per) - 1 else 0.0
+        head = DENSE_GB + (MTP_GB if i == len(per) - 1 else 0.0)
+        need = exp + cache + rope + head + PROMPT_BUFFER_GB + CARD_RESERVE_GB
+        ok = need <= room
+        fits = fits and ok
+        out.append({"layers": (lo, hi), "experts_gb": exp, "kv_gb": cache + rope, "dense_gb": head,
+                    "need_gb": need, "room_gb": room, "fits": ok})
+    return {"cards": out, "fits": fits, "expert_gb": m["arena_gb"],
+            "kv_total_gb": sum(c["kv_gb"] for c in out), "ple_gb": m.get("ple_bytes", 0) / 1e9,
+            "ctx": ctx, "kv": kv}
+
+
+def vram_resident_ctx(model: str, cards: list[float], kv: str = "fp16") -> int:
+    """The longest context setup will recommend with every expert on the GPU: the largest CONTEXTS entry whose
+    plan fits.  0 when even 8K does not (the experts alone do not fit these cards)."""
+    for c in reversed(CONTEXTS):
+        if vram_resident_plan(model, cards, c, kv)["fits"]:
+            return c
+    return 0
+
+
 def low_ram_needed(model, ram) -> bool:
     """The model's experts do not fit this PC's RAM with room left for the rest: they are then mapped from the pack's
     experts.bin instead of copied into RAM (the low-RAM mode)."""
@@ -1872,7 +2031,7 @@ def low_ram_gpu_gb(model, vram_gb, ctx=32768, kv="int8") -> float:
     """About how many GB of the model's experts the GPU's cache holds: its VRAM minus ~5 GB for the dense weights,
     buffers and a 32K context's KV cache, minus the KV cache of a longer context (in VRAM in the low-RAM mode: its RAM
     has no room for KV streaming)."""
-    kv_tok = 13 * (576 if kv == "q4_0" else 1056)       # bytes per context token: 12 QSA layers + the draft layer
+    kv_tok = kv_token_bytes(kv)                          # bytes per context token, all 13 pools
     longer = max(0, ctx - 32768) * kv_tok / 1e9
     return max(0.0, min(MODELS[model]["arena_gb"], vram_gb - 5 - longer))
 
@@ -1983,6 +2142,34 @@ def confirm_paging(model, ram, choice, yes, explicit_model=False):
                                                                           " (--model)" if explicit_model else ""))
 
 
+def model_shard_names(fam: dict, model: str) -> list[str] | None:
+    """The model's GGUF file names in order, or None when setup cannot know them.
+
+    The normal case is the family's own template: a release published as `-0000i-of-0000N` with a fixed N.
+    `"shards": 0` in the model's entry says setup has never pinned that quantization's file count, so the
+    repository is asked (hf_tree_files) and N is read from the suffix the files carry.  Both fail the same way:
+    None, and the caller points at --gguf-dir rather than inventing names."""
+    n = MODELS[model].get("shards", fam.get("shards", 2))
+    if n:
+        return [fam["file"].format(q=model, i=i) for i in range(1, n + 1)]
+    files = hf_tree_files(fam["hf"].format(q=model), model)
+    if not files:
+        return None
+    mine = sorted(nm for nm in files if model.lower() in nm.lower() and SHARD_NAME.search(nm))
+    if not mine:
+        return None
+    m = SHARD_NAME.search(mine[0])
+    total = int(m.group(2))
+    stem = mine[0][:m.start()]
+    named = [f"{stem}-{i:05d}-of-{total:05d}.gguf" for i in range(1, total + 1)]
+    if not all(nm in files for nm in named):
+        say(f"  the repository lists {len(files)} .gguf file(s) for {model}, not the {total} shards its own "
+            "file names promise")
+        return None
+    say(f"  {model}: {total} shard file(s), {sum(files[n] for n in named) / 1e9:.1f} GB, read from the repository")
+    return named
+
+
 def ctx_ram_need(model, ctx, low_ram=False):
     """#406: the RAM (GB) setup estimates for a long context with IQ3_XXS / IQ3_S: their experts + the context's
     8-bit KV cache + 24 GB of room for everything else (the 0.1.29 arithmetic, counted).  None where the context does
@@ -1992,10 +2179,14 @@ def ctx_ram_need(model, ctx, low_ram=False):
     return MODELS[model]["arena_gb"] + ctx * 13 * 1056 / 1e9 + 24
 
 
+RAM_CTX_MAX = 524288     # the RAM rule's own ceiling.  It prices a KV cache streamed into RAM; past 512K the
+                         # decision is the whole-VRAM mode's (the cards hold the cache and the experts, and
+                         # vram_resident_ctx sizes it), not this one's.
 def ram_ctx(model, ram, low_ram=False) -> int:
     """#406: the longest context the RAM rule recommends: 128K, or longer where the estimate fits this PC's RAM.  It
     is part of the recommended default (the smaller of it and the GPU's rule); a longer choice is kept, with a note."""
-    return max(c for c in CONTEXTS if c <= 131072 or (ctx_ram_need(model, c, low_ram) or 0) <= ram)
+    return max(c for c in CONTEXTS if c <= RAM_CTX_MAX and
+               (c <= 131072 or (ctx_ram_need(model, c, low_ram) or 0) <= ram))
 
 
 def settings_path() -> Path:
@@ -2540,9 +2731,11 @@ def main() -> int:
     ap.add_argument("--rope-scale", type=float,
                     help="the extension factor (default: the final context over the trained 262144, at least 1 - "
                          "1.5 for 384K, 2 for 512K, 1 inside the trained range)")
-    ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4"],
-                    help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
-                         "precise) or k8v4 (hybrid: INT8 K + 4-bit V, 816 B/cell)")
+    ap.add_argument("--kv", choices=["fp16", "int8", "q4_0", "k8v4"],
+                    help="KV cache precision above 8K context: int8 (the default, 1,056 B per token per layer), "
+                         "fp16 (full precision, 2,048 B: what every model was trained with, and the default for a "
+                         "model whose experts all fit the GPUs), q4_0 (576 B, a little less precise) or k8v4 "
+                         "(hybrid: INT8 K + 4-bit V, 816 B/cell)")
     ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
                     help="let the model read images (yes = the encoder on the GPU)")
     ap.add_argument("--experimental-speed-projection", metavar="on|off|GGUF",
@@ -2773,6 +2966,13 @@ def main() -> int:
                 verdict = (f"fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, gpu['vram_gb']):.0f}% "
                            "of its experts, " + ("the rest stays in RAM)" if low_ram_resident(m, ram, gpu["vram_gb"])
                                                  else "the rest is read from the SSD as needed)"))
+            if d.get("vram_only"):      # its experts never enter RAM, so the RAM figure is not the question
+                v = vram_resident_plan(m, [x["vram_gb"] for x in chosen], 8192)
+                verdict = ("EXPERIMENTAL, NVIDIA only: keeps all %.0f GB of experts on the GPUs (%s), and needs "
+                           "~%.0f GB of RAM for its n-gram table"
+                           % (d["arena_gb"], "the cards here hold them" if v["fits"]
+                              else "%.0f GB of VRAM between them" % (sum(c["need_gb"] for c in v["cards"])),
+                              d.get("ple_bytes", 0) / 1e9))
             say(f"  {m:8s} needs ~{d['ram_gb']} GB RAM: {verdict}")
         say("\nThis PC can run Strata. Run it again without --check to install.")
         return 0
@@ -2805,10 +3005,38 @@ def main() -> int:
         if low_ram_needed(m, ram) and low_ram_fits(m, ram, gpu["vram_gb"]) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, gpu['vram_gb']):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, gpu["vram_gb"]) else "the rest from the SSD)"))
+        if d.get("vram_only"):
+            say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, keeps its {d['arena_gb']:.0f} GB "
+                f"of experts on the GPU(s) and needs ~{d.get('ple_bytes', 0) / 1e9:.0f} GB of RAM for its n-gram "
+                f"table{fit}")
+            continue
         say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget = None
+    # "vram_only": a model whose experts go on the cards or nowhere (Unsloth's 8-bit file, docs/UNSLOTH_Q8.md).
+    # Decided here, before the RAM questions, because it changes what RAM means for the rest of the setup: the
+    # experts never enter it, the n-gram table does.
+    vram_all = MODELS[model].get("vram_only") and not hip
+    if MODELS[model].get("vram_only") and hip:
+        fail(f"{model} is set up for NVIDIA cards only so far: its prompt kernels are NVIDIA-only and it has not "
+             "been run on AMD", "choose one of the 2-3-bit models, or run setup with --backend cuda")
+    if MODELS[model].get("vram_only"):
+        # The cards are chosen below (step 3 asks); here the question is only whether the idea is possible at all,
+        # so the check is made against the cards as they stand and repeated once the choice is in.
+        cards = [x["vram_gb"] for x in (chosen if multi else [gpu])]
+        warn(f"{model} keeps every expert on the GPU (docs/UNSLOTH_Q8.md): {MODELS[model]['arena_gb']:.0f} GB of "
+             "experts, read across the link once at start and never again while it answers")
+        v = vram_resident_plan(model, cards, 8192)
+        if not v["fits"]:
+            fail(f"{model}'s experts are {MODELS[model]['arena_gb']:.0f} GB and "
+                 f"{len(cards)} {'card' if len(cards) == 1 else 'cards'} of {cards[0]:.0f} GB cannot hold them "
+                 f"beside their own dense weights and buffers (~{sum(c['need_gb'] for c in v['cards']):.0f} GB of "
+                 f"VRAM together, these {'card has' if len(cards) == 1 else 'cards have'} "
+                 f"{sum(cards) * 1.073741824:.0f} GB)",
+                 f"more cards (--gpus 0,1,2,3), a smaller model ({', '.join(m for m in MODELS if not MODELS[m].get('vram_only'))}), "
+                 "or the 4-bit Unsloth file (--model UD-Q4_K_XL), which reads its experts from the SSD")
+        ok(f"every expert fits: {sum(cards) * 1.0737:.0f} GB of VRAM across {len(cards)} card(s)")
     if MODELS[model].get("budget"):
         # Unsloth's UD-Q4_K_XL: a RAM budget of experts, the rest from the GGUF on the SSD - not the low-RAM mode (no
         # experts.bin: it would be another 77 GB on the disk), and one GPU (the budget mode has no layer split)
@@ -2839,12 +3067,14 @@ def main() -> int:
             multi, sel, chosen = [], [gpu["index"]], [gpu]
     elif a.resident_budget_gib is not None:
         warn(f"--resident-budget-gib is for UD-Q4_K_XL: {model} keeps all of its experts in RAM or in the low-RAM mode")
-    low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
-                                  (a.low_ram == "auto" and low_ram_needed(model, ram)))
+    low_ram = budget is None and not vram_all and (a.low_ram in ("on", "resident", "mmap") or
+                                                   (a.low_ram == "auto" and low_ram_needed(model, ram)))
+    if vram_all and a.low_ram not in ("auto", "off"):
+        warn(f"--low-ram {a.low_ram} does not apply to {model}: none of its experts go into RAM at all")
     if low_ram and multi and not low_ram_together(a, model, ram, gpu, chosen):
         multi, sel, chosen = [], [gpu["index"]], [gpu]
     # (the low-RAM mode's variant is decided once the context is known, below; on several GPUs it is the mapped one)
-    if not low_ram and budget is None and ram < MODELS[model]["ram_gb"] - 4:
+    if not low_ram and budget is None and not vram_all and ram < MODELS[model]["ram_gb"] - 4:
         confirm_paging(model, ram, a.low_ram, a.yes, bool(a.model))
     ok(f"size: {model}")
     tag = fam["tag"] + model                           # names of the pack, config and start script
@@ -2852,8 +3082,13 @@ def main() -> int:
     rec_ctx = 32768 if small < 14 else 65536 if small < 20 else 131072
     if budget is not None:                             # UD-Q4_K_XL: every GB of KV is a GB fewer of cached experts
         rec_ctx = 8192 if small < 14 else 32768
-    # #406: the RAM rule is part of the recommendation (the smaller of the two), no longer a cap over the user's choice
-    rec_ctx = min(rec_ctx, ram_ctx(model, ram, low_ram))
+    if vram_all:
+        # Nothing competes with the context except the experts, and they are already placed: the recommendation is
+        # the longest context whose plan still fits the cards, which is a different question from the small-card one
+        # above and is answered by the same arithmetic the engine checks at load.
+        rec_ctx = vram_resident_ctx(model, [x["vram_gb"] for x in chosen], a.kv or "fp16") or 8192
+    # #406: the RAM rule is part of the recommendation (the smaller of it and the GPU's rule), no longer a cap
+    rec_ctx = min(rec_ctx, ram_ctx(model, ram, low_ram)) if not vram_all else rec_ctx
     if a.context:
         ctx = a.context
     else:
@@ -2869,6 +3104,21 @@ def main() -> int:
             say(f"  {i}) {c // 1024}K tokens{note}")
         ctx = CONTEXTS[int(ask("Context?", [str(i) for i in range(1, len(CONTEXTS) + 1)],
                                str(CONTEXTS.index(rec_ctx) + 1), a.yes)) - 1]
+    if vram_all:
+        # The context is the one thing beside the experts that competes for the same VRAM, and here there is no
+        # streaming and no RAM copy to fall back on: a context whose plan does not fit is a run that cannot start.
+        plan = vram_resident_plan(model, [x["vram_gb"] for x in chosen], ctx, a.kv or "fp16")
+        if not plan["fits"]:
+            worst = max(plan["cards"], key=lambda c: c["need_gb"] - c["room_gb"])
+            fail(f"a {ctx} token {a.kv or 'fp16'} KV cache does not fit beside {model}'s experts: the card that "
+                 f"runs out first needs {worst['need_gb']:.1f} GB of its {worst['room_gb']:.1f} GB "
+                 f"({worst['experts_gb']:.1f} GB experts + {worst['kv_gb']:.1f} GB of cache + "
+                 f"{worst['dense_gb']:.1f} GB of its own weights and buffers)",
+                 f"--context {vram_resident_ctx(model, [x['vram_gb'] for x in chosen], a.kv or 'fp16')} or less, "
+                 "another card with --gpus, or --kv int8 (half the cache, 1,056 B a token instead of 2,048)")
+        ok(f"the context fits the cards: {plan['kv_total_gb']:.1f} GB of KV cache over "
+           f"{len(plan['cards'])} of them, {min(c['room_gb'] - c['need_gb'] for c in plan['cards']):.1f} GB spare "
+           "on the fullest")
     # #406 #364: a context past the RAM rule (an explicit --context, a pick in the list, or the earlier install's) is
     # kept, with what it risks.  It used to become 128K: users ran 256K fine where setup's estimate said no.
     need_gb = ctx_ram_need(model, ctx, low_ram)
@@ -2896,9 +3146,15 @@ def main() -> int:
                   else "as requested")
         ok(f"rope scaling: {scaling}, factor {rope_scale:g} ({origin})")
     ok(f"context: {ctx} tokens")
-    # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21)
-    kv = "fp16" if ctx <= 8192 else (a.kv or "int8")
-    if ctx > 8192 and not a.kv and not a.yes:
+    # the KV cache (the model's memory of the conversation): full precision, 8-bit, or 4-bit after a Hadamard
+    # rotation (PR #21).  Full precision is what a small card cannot afford and a big one has no reason to want:
+    # with every expert already resident the cache is the only thing left to trade, and trading it saves VRAM that
+    # has nothing else to spend it on.  So the whole-VRAM mode defaults to fp16 and every other one to int8.
+    if vram_all:
+        kv = a.kv or "fp16"
+    else:
+        kv = "fp16" if ctx <= 8192 else (a.kv or "int8")
+    if ctx > 8192 and not a.kv and not a.yes and not vram_all:
         say()
         say("  KV cache precision (the model's memory of the conversation):")
         say("  1) 8-bit   (recommended: what every published number was measured with)")
@@ -2906,7 +3162,9 @@ def main() -> int:
         say("             documents; long-context lookups (needle tests) still pass")
         kv = ["int8", "q4_0"][int(ask("KV cache?", ["1", "2"], "1", a.yes)) - 1]
     if ctx > 8192:
-        ok(f"KV cache: {'8-bit' if kv == 'int8' else '4-bit (Hadamard-rotated)'}")
+        ok("KV cache: " + {"fp16": "full precision (fp16, 2,048 B per token per layer)",
+                           "int8": "8-bit", "q4_0": "4-bit (Hadamard-rotated)",
+                           "k8v4": "hybrid: 8-bit keys, 4-bit values"}[kv])
     if fam.get("vision") is False:
         vision = "none"
         if a.vision not in (None, "no", "none"):
@@ -2973,8 +3231,15 @@ def main() -> int:
         warn("the experimental speed projection is made for the original Qwen3.8-Flash-Next, not Swift 1.5: left off"
              if family == "swift" else f"the experimental speed projection is not tested with {model}: left off")
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
-    shards = gguf_dir_shards(models_dir, fam, model) if a.gguf_dir else \
-        [models_dir / fam["file"].format(q=model, i=i) for i in range(1, fam.get("shards", 2) + 1)]
+    # An unpinned release (`"shards": 0`) has its file list read from the repository: the count is a property of
+    # the quantization, and setup will not invent names for a download it is about to start.
+    named = gguf_dir_shards(models_dir, fam, model) if a.gguf_dir else \
+        [models_dir / n for n in (model_shard_names(fam, model) or [])]
+    if not named:
+        fail(f"setup does not know how many files {model} is published in, and the repository would not tell it",
+             "check your connection and run again, or pass --gguf-dir with the files already downloaded (their "
+             "names tell setup how many there are)")
+    shards = named
     if not a.gguf_dir and not all(sh.exists() and done(sh) for sh in shards):
         for r in elsewhere:                            # already downloaded in a Strata folder on another drive
             cand = [r / "models" / tag / sh.name for sh in shards]
@@ -3032,6 +3297,10 @@ def main() -> int:
     else:
         lib_dirs = meta.get("lib_dirs") or meta.get("cuda_dirs") or cuda_lib_dirs()
     engine_ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit())
+    if vram_all and engine_ver < ALL_VRAM_ENGINE:      # checked before the 188 GB download
+        fail(f"{model} needs engine {'.'.join(map(str, ALL_VRAM_ENGINE))} or newer for --all-experts-vram; this one "
+             f"is {meta.get('version')}", "update Strata (or compile the engine with --build) and run setup again, "
+             "or choose the 4-bit Unsloth file (--model UD-Q4_K_XL), which 0.1.32 and newer configure")
     if budget is not None and engine_ver < UNSLOTH_ENGINE:    # checked before the 111 GB download
         fail(f"{model} needs engine {'.'.join(map(str, UNSLOTH_ENGINE))} or newer; this one is {meta.get('version')}",
              "update Strata (or compile the engine with --build) and run setup again")
@@ -3117,9 +3386,20 @@ def main() -> int:
     step(7, "writing the start script")
     sys.path.insert(0, str(ROOT / "tools"))
     from gguf_reader import GGUFFile                   # the PLE table's shard: shard 2 (original) or 1 (Swift)
-    ple = next((s for s in shards if any(t.name == "per_layer_token_embd.weight" for t in GGUFFile(s).tensors)), None)
+    ple, ple_t = None, None
+    for s in shards:                                   # the table's own shard, and its own size in the file
+        for t in GGUFFile(s).tensors:
+            if t.name == "per_layer_token_embd.weight":
+                ple, ple_t = s, t
     if ple is None:
         fail("the model has no per_layer_token_embd tensor (is this a Qwen3.8-Flash-Next GGUF?)")
+    # The table's bytes come from the file rather than from MODELS: the same tensor is IQ4_NL in one release
+    # (90 B a row) and Q8_0 in another (170 B), and the tier it can afford is a different answer either way.
+    try:                        # a test double may name the tensor without sizing it: then the model's own figure
+        ple_bytes = int(ple_t.expected_bytes() or 0)
+    except (AttributeError, TypeError):
+        ple_bytes = int(MODELS[model].get("ple_bytes", 0))
+    ple_io = ple_tier(ple_bytes / 1e9, ram)
     # (a 4-shard file: the engine finds the PLE table's shard itself from shard 1, the measured setup)
     args = ["--pack", str(pack), "--native", str(shards[0]), *(["--ple-gguf", str(ple)] if len(shards) <= 2 else []),
             "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
@@ -3127,8 +3407,14 @@ def main() -> int:
             "--max-context", str(ctx)]
     if scaling is not None:     # the resolved config: explicit flags as given, or the automatic yarn+factor
         args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
-    if ctx > 8192:
+    if ctx > 8192 or kv != "int8":      # fp16 is the engine's default, but a config that says so is readable
         args += ["--kv", kv]
+    if vram_all:
+        # The mode itself, and the tier the n-gram table goes to (the one thing this mode keeps off the GPUs).
+        # --mmap-experts is what makes "no host arena" true: the bytes go from the model's file straight into the
+        # cards' slots.  The engine implies it from --all-experts-vram; it is written so that an older engine,
+        # which would allocate 128 GB of pinned RAM instead, fails at start rather than after an hour.
+        args += ["--all-experts-vram", "--mmap-experts", "--ple-io", ple_io]
     if resident and a.low_ram != "resident" and engine_ver < RESIDENT_ENGINE:
         resident = False                               # an engine from before --resident-experts would refuse it
         ok(f"low-RAM mode: engine {meta.get('version')} has no resident variant yet; the experts are read through "
@@ -3138,13 +3424,16 @@ def main() -> int:
     # KV streaming: from 64K up the whole KV cache lives in RAM and only the part the attention reads (32K positions
     # per layer) stays in VRAM; the VRAM it frees holds more experts (+6% at 128K, +23% at 262K with Q2_0). It
     # costs ~13.7 KB of RAM per context token with 8-bit KV (1.7 GB at 128K), 7.5 KB with 4-bit, so only when it fits.
-    kv_ram_gb = ctx * (13 * (576 if kv == "q4_0" else 1056)) / 1e9   # 12 QSA layers + the draft layer
+    kv_ram_gb = ctx * kv_token_bytes(kv) / 1e9     # 12 QSA layers + the draft layer
     # Hybrid K8V4 never streams its KV (mode 0 only, layer.hpp), so it is excluded from the WHOLE streaming
     # decision rather than one threshold at a time - a future tier added to this chain cannot reintroduce the
     # combination the engine refuses (PR review).
     # --kv-streaming on|off overrides the RAM test (the owner's rule); k8v4 and WSL stay off - they cannot stream.
     stream_fits = ram >= MODELS[model]["ram_gb"] + kv_ram_gb + 1
-    if kv == "k8v4":
+    if vram_all:
+        ok(f"KV streaming off: with every expert already on the GPU the cache is what the freed VRAM would be "
+           f"spent on{'' if kv == 'fp16' else ', and it is not needed'}")
+    elif kv == "k8v4":
         if ctx >= 65536:
             ok("KV streaming off: not supported with --kv k8v4; the KV cache stays in VRAM")
         if a.kv_streaming == "on":
